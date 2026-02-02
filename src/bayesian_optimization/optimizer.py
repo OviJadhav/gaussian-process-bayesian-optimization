@@ -68,7 +68,18 @@ class BayesianOptimizer:
         # Storage for observations
         self.X_observed = []
         self.y_observed = []
-        
+    
+    def _normalize(self, X):
+        """Normalizing inputs to [0, 1] for GP stability."""
+        X = np.atleast_2d(X)
+        return (X - self.bounds[:, 0]) / (self.bounds[:, 1] - self.bounds[:, 0])
+    
+    def _denormalize(self, X_norm):
+        """Denormalizing from [0, 1] back to original space."""
+        X_norm = np.atleast_2d(X_norm)
+        return X_norm * (self.bounds[:, 1] - self.bounds[:, 0]) + self.bounds[:, 0]    
+
+
     def _random_sample(self, n_samples=1):
         """Generate random samples within bounds."""
         samples = self.rng.uniform(
@@ -117,28 +128,67 @@ class BayesianOptimizer:
         return best_x.reshape(1, -1)
     
     def suggest(self):
-        """
-        Suggest the next point to evaluate.
-        
-        Returns:
-            X_next: Next point to evaluate, shape (1, n_dims)
-        """
+        """Suggest the next point to evaluate."""
         n_observed = len(self.y_observed)
         
         # Initial random exploration
         if n_observed < self.n_initial:
             return self._random_sample(1)
         
-        # Fit GP to observed data
-        X = np.array(self.X_observed)
+        # Normalize observed data for GP
+        X_norm = self._normalize(np.array(self.X_observed))
         y = np.array(self.y_observed)
-        self.gp.fit(X, y)
         
-        # Optimize acquisition function
-        X_next = self._optimize_acquisition()
+        # Fit GP to normalized data
+        self.gp.fit(X_norm, y)
+        
+        # Optimize GP hyperparameters every 5 iterations
+        if n_observed % 5 == 0:
+            try:
+                self.gp.optimize_hyperparameters(X_norm, y, n_restarts=3)
+            except:
+                pass  # If optimization fails, keep current hyperparameters
+        
+        # Optimize acquisition function in normalized space
+        X_next_norm = self._optimize_acquisition_normalized()
+        
+        # Denormalize back to original space
+        X_next = self._denormalize(X_next_norm)
         
         return X_next
     
+
+    def _optimize_acquisition_normalized(self):
+        """Optimizing acquisition in normalized [0,1] space."""
+        y_best = np.max(self.y_observed)
+        
+        def neg_acquisition(X_norm):
+            X_norm = X_norm.reshape(1, -1)
+            return -self.acquisition_function(X_norm, self.gp, y_best)[0]
+        
+        # Bounds in normalized space
+        norm_bounds = [(0, 1)] * self.n_dims
+        
+        best_acq = np.inf
+        best_x = None
+        
+        for _ in range(self.n_restarts):
+            x0 = self.rng.uniform(0, 1, self.n_dims)
+            
+            result = minimize(
+                neg_acquisition,
+                x0,
+                bounds=norm_bounds,
+                method='L-BFGS-B'
+            )
+            
+            if result.fun < best_acq:
+                best_acq = result.fun
+                best_x = result.x
+        
+        return best_x.reshape(1, -1)
+    
+
     def observe(self, X, y):
         """
         Record an observation.
